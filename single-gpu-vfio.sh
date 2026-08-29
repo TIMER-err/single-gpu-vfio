@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly INSTALLED_TOOL="/usr/local/sbin/single-gpu-vfio"
 readonly CONFIG_FILE="/etc/single-gpu-vfio.conf"
 readonly HOOK_FILE="/etc/libvirt/hooks/qemu.d/10-single-gpu-vfio"
@@ -19,7 +19,7 @@ die()  { printf '[single-gpu-vfio] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-single-gpu-vfio 2.1.0
+single-gpu-vfio 2.2.0
 
 Personal Arch/EndeavourOS + GRUB + NVIDIA single-GPU VFIO tool.
 
@@ -66,7 +66,7 @@ create-vm options:
   --rom PATH                 Patched or raw VBIOS (required and revalidated)
   --gpu BDF                  NVIDIA GPU PCI address (auto-detected if omitted)
   --audio BDF                NVIDIA HDMI audio address (auto-detected if omitted)
-  --host-audio DEV           Host ALSA output (default: auto; use none to disable)
+  --sound BDF                Physical host sound card (auto-detected; none disables)
   --usb BDF                  Whole USB controller to pass through (required)
   --disk PATH                qcow2 path (default: /var/lib/libvirt/images/NAME.qcow2)
   --disk-size SIZE           New disk size (default: 40G)
@@ -164,6 +164,7 @@ load_config() {
     # The file is generated root-owned and mode 0600 by this tool.
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
+    SOUND_BDF="${SOUND_BDF:-none}"
 }
 
 state_dir() {
@@ -208,47 +209,19 @@ detect_gpu_audio() {
     done < <(lspci -Dnn | awk '/NVIDIA/ && /Audio device/ {print $1}')
 }
 
-detect_host_audio_output() {
-    local card_path card_number card_id card_bdf pcm_node device_number
-    for card_path in /sys/class/sound/card[0-9]*; do
-        [[ -e "$card_path" ]] || continue
-        card_number="${card_path##*card}"
-        [[ -r "/proc/asound/card${card_number}/id" ]] || continue
-        card_id="$(<"/proc/asound/card${card_number}/id")"
-        card_bdf="$(basename "$(readlink -f "$card_path/device" 2>/dev/null || true)")"
-        [[ "$card_bdf" != "$AUDIO_BDF" ]] || continue
-        for pcm_node in /dev/snd/pcmC"${card_number}"D*p; do
-            [[ -e "$pcm_node" ]] || continue
-            device_number="${pcm_node##*D}"
-            device_number="${device_number%p}"
-            printf 'hw:%s,%s\n' "$card_id" "$device_number"
-            return
-        done
-    done
+detect_host_sound() {
+    lspci -Dnn | awk '
+        /Audio device/ && !/NVIDIA/ { print $1; exit }
+    '
 }
 
-host_audio_nodes() {
-    [[ "${HOST_AUDIO_ALSA:-none}" != none ]] || return 0
-    local spec card_token device_number card_path card_number card_id
-    spec="${HOST_AUDIO_ALSA#hw:}"
-    card_token="${spec%%,*}"
-    device_number="${spec#*,}"
-    if [[ "$card_token" =~ ^[0-9]+$ ]]; then
-        card_number="$card_token"
-    else
-        card_number=''
-        for card_path in /proc/asound/card[0-9]*; do
-            [[ -r "$card_path/id" ]] || continue
-            card_id="$(<"$card_path/id")"
-            if [[ "$card_id" == "$card_token" ]]; then
-                card_number="${card_path##*card}"
-                break
-            fi
-        done
-    fi
-    [[ -n "$card_number" ]] || return 1
-    [[ -e "/dev/snd/pcmC${card_number}D${device_number}p" ]] || return 1
-    printf '%s\n' "/dev/snd/controlC${card_number}" "/dev/snd/pcmC${card_number}D${device_number}p"
+iommu_group_members() {
+    local bdf="$1" group_path member
+    group_path="$(readlink -f "/sys/bus/pci/devices/$bdf/iommu_group" 2>/dev/null || true)"
+    [[ -n "$group_path" && -d "$group_path/devices" ]] || return 1
+    for member in "$group_path"/devices/*; do
+        printf '%s\n' "${member##*/}"
+    done
 }
 
 iommu_active() {
@@ -299,7 +272,7 @@ install_packages() {
     log "Installing KVM/libvirt/OVMF dependencies..."
     pacman -S --needed --noconfirm \
         qemu-desktop libvirt virt-manager edk2-ovmf swtpm dnsmasq \
-        acl alsa-utils pciutils psmisc python ripgrep
+        pciutils psmisc python ripgrep
     systemctl enable --now libvirtd.service
 }
 
@@ -589,7 +562,7 @@ write_config() {
         config_value GPU_BDF "$GPU_BDF"
         config_value AUDIO_BDF "$AUDIO_BDF"
         config_value USB_BDF "$USB_BDF"
-        config_value HOST_AUDIO_ALSA "$HOST_AUDIO_ALSA"
+        config_value SOUND_BDF "$SOUND_BDF"
         config_value GPU_HOST_DRIVER "$GPU_HOST_DRIVER"
         config_value AUDIO_HOST_MODULE "$AUDIO_HOST_MODULE"
         config_value USB_HOST_MODULE "$USB_HOST_MODULE"
@@ -618,30 +591,34 @@ EOF
 
 create_domain_xml() {
     local output="$1"
-    local gpu_source audio_source usb_source
+    local gpu_source audio_source usb_source sound_source
     gpu_source="$(pci_xml_address "$GPU_BDF")"
     audio_source="$(pci_xml_address "$AUDIO_BDF")"
     usb_source="$(pci_xml_address "$USB_BDF")"
+    sound_source=''
+    if [[ "$SOUND_BDF" != none ]]; then
+        sound_source="$(pci_xml_address "$SOUND_BDF")"
+    fi
 
-    local vm_xml iso_xml disk_xml rom_xml code_xml vars_xml host_audio_xml uuid_xml
+    local vm_xml iso_xml disk_xml rom_xml code_xml vars_xml uuid_xml
     vm_xml="$(xml_escape "$VM_NAME")"
     iso_xml="$(xml_escape "$ISO_PATH")"
     disk_xml="$(xml_escape "$DISK_PATH")"
     rom_xml="$(xml_escape "$ROM_PATH")"
     code_xml="$(xml_escape "$OVMF_CODE")"
     vars_xml="$(xml_escape "$OVMF_VARS")"
-    host_audio_xml="$(xml_escape "$HOST_AUDIO_ALSA")"
     uuid_xml=''
     if [[ -n "${VM_UUID:-}" ]]; then
         uuid_xml="  <uuid>$(xml_escape "$VM_UUID")</uuid>"
     fi
 
-    local sound_xml audio_xml
-    sound_xml=''
-    audio_xml='    <audio id="1" type="none"/>'
-    if [[ "$HOST_AUDIO_ALSA" != none ]]; then
-        sound_xml='    <sound model="ich9"><audio id="1"/></sound>'
-        audio_xml="    <audio id=\"1\" type=\"alsa\"><output dev=\"$host_audio_xml\"/></audio>"
+    local sound_hostdev_xml
+    sound_hostdev_xml=''
+    if [[ "$SOUND_BDF" != none ]]; then
+        sound_hostdev_xml="    <hostdev mode=\"subsystem\" type=\"pci\" managed=\"yes\">
+      <driver name=\"vfio\"/>
+      <source>$sound_source</source>
+    </hostdev>"
     fi
 
     cat >"$output" <<EOF
@@ -711,8 +688,7 @@ $uuid_xml
       <source network="default"/>
       <model type="virtio"/>
     </interface>
-$sound_xml
-$audio_xml
+    <audio id="1" type="none"/>
     <video>
       <model type="none"/>
     </video>
@@ -732,6 +708,7 @@ $audio_xml
       <driver name="vfio"/>
       <source>$usb_source</source>
     </hostdev>
+$sound_hostdev_xml
     <memballoon model="virtio"/>
     <rng model="virtio">
       <backend model="random">/dev/urandom</backend>
@@ -746,11 +723,10 @@ runtime_preflight() {
     iommu_active || die "No IOMMU groups are active; check firmware settings and GRUB, then reboot."
     [[ -f "$ROM_PATH" ]] || die "ROM is missing: $ROM_PATH"
     [[ -f "$DISK_PATH" ]] || die "Virtual disk is missing: $DISK_PATH"
-    if [[ "${HOST_AUDIO_ALSA:-none}" != none ]]; then
-        host_audio_nodes >/dev/null || die "Host ALSA output is unavailable: $HOST_AUDIO_ALSA"
-    fi
+    local -a devices=("$GPU_BDF" "$AUDIO_BDF" "$USB_BDF")
+    [[ "$SOUND_BDF" == none ]] || devices+=("$SOUND_BDF")
     local bdf
-    for bdf in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for bdf in "${devices[@]}"; do
         [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI device does not exist: $bdf"
         [[ -L "/sys/bus/pci/devices/$bdf/iommu_group" ]] || die "PCI device has no IOMMU group: $bdf"
     done
@@ -786,7 +762,7 @@ hook_prepare() (
     printf '%s\n' preparing >"$state/status"
     : >"$state/vtconsoles"
     : >"$state/services"
-    : >"$state/audio-acl"
+    : >"$state/sound-group-companions"
     rm -f "$state/display-manager-was-active"
 
     local service
@@ -814,18 +790,16 @@ hook_prepare() (
         hlog "force-killed remaining uid $HOST_UID processes"
     fi
 
-    if [[ "${HOST_AUDIO_ALSA:-none}" != none ]]; then
-        require_command setfacl
-        host_audio_nodes >/dev/null || die "Host ALSA output is unavailable: $HOST_AUDIO_ALSA"
-        local audio_node audio_account
-        while read -r audio_node; do
-            for audio_account in libvirt-qemu qemu; do
-                getent passwd "$audio_account" >/dev/null || continue
-                setfacl -m "u:${audio_account}:rw" "$audio_node"
-                printf '%s %s\n' "$audio_account" "$audio_node" >>"$state/audio-acl"
-            done
-        done < <(host_audio_nodes)
-        hlog "granted QEMU access to $HOST_AUDIO_ALSA"
+    if [[ "$SOUND_BDF" != none ]]; then
+        local group_member group_driver
+        while read -r group_member; do
+            [[ "$group_member" != "$SOUND_BDF" ]] || continue
+            group_driver="$(pci_driver "$group_member")"
+            [[ "$group_driver" != unbound ]] || continue
+            printf '%s %s\n' "$group_member" "$group_driver" >>"$state/sound-group-companions"
+            printf '%s' "$group_member" >"/sys/bus/pci/devices/$group_member/driver/unbind"
+            hlog "temporarily unbound sound-group companion $group_member from $group_driver"
+        done < <(iommu_group_members "$SOUND_BDF")
     fi
 
     local -a nvidia_nodes=()
@@ -901,8 +875,10 @@ hook_release() (
     modprobe "$AUDIO_HOST_MODULE"
     modprobe "$USB_HOST_MODULE"
 
+    local -a devices=("$GPU_BDF" "$AUDIO_BDF" "$USB_BDF")
+    [[ "$SOUND_BDF" == none ]] || devices+=("$SOUND_BDF")
     local device
-    for device in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for device in "${devices[@]}"; do
         if [[ -e "/sys/bus/pci/devices/$device" && ! -L "/sys/bus/pci/devices/$device/driver" ]]; then
             printf '%s' "$device" >/sys/bus/pci/drivers_probe || true
         fi
@@ -920,11 +896,12 @@ hook_release() (
         local service
         while read -r service; do systemctl start "$service" || true; done <"$state/services"
     fi
-    if [[ -s "$state/audio-acl" ]]; then
-        local audio_account audio_node
-        while read -r audio_account audio_node; do
-            setfacl -x "u:${audio_account}" "$audio_node" 2>/dev/null || true
-        done <"$state/audio-acl"
+    if [[ -s "$state/sound-group-companions" ]]; then
+        local group_member group_driver
+        while read -r group_member group_driver; do
+            [[ -e "/sys/bus/pci/devices/$group_member" && ! -L "/sys/bus/pci/devices/$group_member/driver" ]] && \
+                printf '%s' "$group_member" >/sys/bus/pci/drivers_probe || true
+        done <"$state/sound-group-companions"
     fi
     if [[ -e "$state/display-manager-was-active" ]]; then
         systemctl start "$DISPLAY_MANAGER"
@@ -959,8 +936,10 @@ cmd_recover() {
         die "$VM_NAME is still active; run shutdown or force-stop first."
     fi
 
+    local -a devices=("$GPU_BDF" "$AUDIO_BDF" "$USB_BDF")
+    [[ "$SOUND_BDF" == none ]] || devices+=("$SOUND_BDF")
     local device path driver
-    for device in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for device in "${devices[@]}"; do
         path="/sys/bus/pci/devices/$device"
         [[ -e "$path" ]] || continue
         driver="$(pci_driver "$device")"
@@ -976,7 +955,7 @@ cmd_recover() {
     modprobe nvidia_drm
     modprobe "$AUDIO_HOST_MODULE"
     modprobe "$USB_HOST_MODULE"
-    for device in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for device in "${devices[@]}"; do
         [[ -e "/sys/bus/pci/devices/$device" && ! -L "/sys/bus/pci/devices/$device/driver" ]] && \
             printf '%s' "$device" >/sys/bus/pci/drivers_probe || true
     done
@@ -990,12 +969,13 @@ cmd_recover() {
     for service in $GPU_SERVICES; do
         systemctl is-enabled --quiet "$service" 2>/dev/null && systemctl start "$service" || true
     done
-    local state audio_account audio_node
+    local state group_member group_driver
     state="$(state_dir)"
-    if [[ -s "$state/audio-acl" ]]; then
-        while read -r audio_account audio_node; do
-            setfacl -x "u:${audio_account}" "$audio_node" 2>/dev/null || true
-        done <"$state/audio-acl"
+    if [[ -s "$state/sound-group-companions" ]]; then
+        while read -r group_member group_driver; do
+            [[ -e "/sys/bus/pci/devices/$group_member" && ! -L "/sys/bus/pci/devices/$group_member/driver" ]] && \
+                printf '%s' "$group_member" >/sys/bus/pci/drivers_probe || true
+        done <"$state/sound-group-companions"
     fi
     systemctl start "$DISPLAY_MANAGER"
     log "Requested host GPU recovery and started $DISPLAY_MANAGER."
@@ -1008,11 +988,12 @@ cmd_check() {
     show_iommu_group "$GPU_BDF" || true
     show_iommu_group "$AUDIO_BDF" || true
     show_iommu_group "$USB_BDF" || true
+    [[ "$SOUND_BDF" == none ]] || show_iommu_group "$SOUND_BDF" || true
     printf '\nDrivers:\n'
     printf '  %-14s %s\n' "$GPU_BDF" "$(pci_driver "$GPU_BDF")"
     printf '  %-14s %s\n' "$AUDIO_BDF" "$(pci_driver "$AUDIO_BDF")"
     printf '  %-14s %s\n' "$USB_BDF" "$(pci_driver "$USB_BDF")"
-    printf '\nHost audio backend:\n  %s\n' "${HOST_AUDIO_ALSA:-none}"
+    [[ "$SOUND_BDF" == none ]] || printf '  %-14s %s (physical sound card)\n' "$SOUND_BDF" "$(pci_driver "$SOUND_BDF")"
     printf '\nFiles:\n'
     stat -c '  %A %U:%G %s %n' "$ROM_PATH" "$DISK_PATH" "$ISO_PATH" 2>/dev/null || true
     qemu-img check "$DISK_PATH"
@@ -1081,8 +1062,10 @@ cmd_status() {
     printf 'VM: %s\n' "$VM_NAME"
     virsh -c qemu:///system domstate "$VM_NAME" 2>/dev/null || true
     printf '\nPCI drivers:\n'
+    local -a devices=("$GPU_BDF" "$AUDIO_BDF" "$USB_BDF")
+    [[ "$SOUND_BDF" == none ]] || devices+=("$SOUND_BDF")
     local device
-    for device in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for device in "${devices[@]}"; do
         printf '  %-14s %s\n' "$device" "$(pci_driver "$device")"
     done
     printf '\nTransient safety timers:\n'
@@ -1250,7 +1233,7 @@ cmd_create_vm() {
     GPU_BDF=''
     AUDIO_BDF=''
     USB_BDF=''
-    HOST_AUDIO_ALSA='auto'
+    SOUND_BDF='auto'
     DISK_PATH=''
     DISK_SIZE='40G'
     MEMORY_MIB='8192'
@@ -1268,7 +1251,7 @@ cmd_create_vm() {
             --rom) ROM_SOURCE="${2:?}"; shift 2 ;;
             --gpu) GPU_BDF="${2:?}"; shift 2 ;;
             --audio) AUDIO_BDF="${2:?}"; shift 2 ;;
-            --host-audio) HOST_AUDIO_ALSA="${2:?}"; shift 2 ;;
+            --sound) SOUND_BDF="${2:?}"; shift 2 ;;
             --usb) USB_BDF="${2:?}"; shift 2 ;;
             --disk) DISK_PATH="${2:?}"; shift 2 ;;
             --disk-size) DISK_SIZE="${2:?}"; shift 2 ;;
@@ -1310,34 +1293,34 @@ cmd_create_vm() {
     [[ -n "$AUDIO_BDF" ]] || die "No matching NVIDIA HDMI audio device was found; use --audio."
     AUDIO_BDF="$(normalize_bdf "$AUDIO_BDF")"
     USB_BDF="$(normalize_bdf "$USB_BDF")"
+    if [[ "$SOUND_BDF" == auto ]]; then
+        SOUND_BDF="$(detect_host_sound || true)"
+        if [[ -z "$SOUND_BDF" ]]; then
+            SOUND_BDF=none
+            warn "No non-NVIDIA PCI sound card was detected; only HDMI/DP audio will be passed through."
+        fi
+    elif [[ "$SOUND_BDF" != none ]]; then
+        SOUND_BDF="$(normalize_bdf "$SOUND_BDF")"
+    fi
 
+    local -a devices=("$GPU_BDF" "$AUDIO_BDF" "$USB_BDF")
+    [[ "$SOUND_BDF" == none ]] || devices+=("$SOUND_BDF")
     local bdf
-    for bdf in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
+    for bdf in "${devices[@]}"; do
         [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI device does not exist: $bdf"
     done
     [[ "$(pci_class "$GPU_BDF")" == 0x0300* || "$(pci_class "$GPU_BDF")" == 0x0302* ]] || die "$GPU_BDF is not a VGA/3D controller."
     [[ "$(pci_class "$AUDIO_BDF")" == 0x0403* ]] || die "$AUDIO_BDF is not an HDA audio device."
     [[ "$(pci_class "$USB_BDF")" == 0x0c03* ]] || die "$USB_BDF is not a USB controller."
+    if [[ "$SOUND_BDF" != none ]]; then
+        [[ "$SOUND_BDF" != "$AUDIO_BDF" ]] || die "--sound must not duplicate the NVIDIA --audio device."
+        [[ "$(pci_class "$SOUND_BDF")" == 0x0403* ]] || die "$SOUND_BDF is not an HDA audio device."
+        log "Physical sound card selected for passthrough: $SOUND_BDF"
+    fi
     GPU_HOST_DRIVER="$(pci_driver "$GPU_BDF")"
     [[ "$GPU_HOST_DRIVER" == nvidia ]] || die "GPU must use the nvidia driver; current driver: $GPU_HOST_DRIVER"
     AUDIO_HOST_MODULE='snd_hda_intel'
     USB_HOST_MODULE='xhci_pci'
-
-    if [[ "$HOST_AUDIO_ALSA" == auto ]]; then
-        HOST_AUDIO_ALSA="$(detect_host_audio_output || true)"
-        if [[ -z "$HOST_AUDIO_ALSA" ]]; then
-            HOST_AUDIO_ALSA=none
-            warn "No non-GPU ALSA playback device was detected; only HDMI/DP audio will be available."
-        else
-            log "Using host ALSA output: $HOST_AUDIO_ALSA"
-        fi
-    elif [[ "$HOST_AUDIO_ALSA" != none ]]; then
-        [[ "$HOST_AUDIO_ALSA" =~ ^hw:[A-Za-z0-9_-]+,[0-9]+$ ]] || \
-            die "--host-audio must be auto, none, or an ALSA hardware PCM such as hw:PCH,0."
-    fi
-    if [[ "$HOST_AUDIO_ALSA" != none ]]; then
-        host_audio_nodes >/dev/null || die "Host ALSA output is unavailable: $HOST_AUDIO_ALSA"
-    fi
 
     DISPLAY_MANAGER="${DISPLAY_MANAGER:-$(detect_display_manager)}"
     [[ "$DISPLAY_MANAGER" == *.service ]] || DISPLAY_MANAGER="${DISPLAY_MANAGER}.service"
@@ -1362,7 +1345,8 @@ cmd_create_vm() {
     show_iommu_group "$GPU_BDF" || true
     show_iommu_group "$AUDIO_BDF" || true
     show_iommu_group "$USB_BDF" || true
-    confirm "Can every device in these groups be assigned to the VM?"
+    [[ "$SOUND_BDF" == none ]] || show_iommu_group "$SOUND_BDF" || true
+    confirm "Can the selected devices be handed off and active group companions be temporarily unbound?"
 
     DISK_PATH="${DISK_PATH:-/var/lib/libvirt/images/${VM_NAME}.qcow2}"
     [[ "$ISO_PATH" == /* && "$ROM_SOURCE" == /* && "$DISK_PATH" == /* ]] || \

@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
-readonly VERSION="1.0.0"
+readonly VERSION="2.0.0"
 readonly INSTALLED_TOOL="/usr/local/sbin/single-gpu-vfio"
 readonly CONFIG_FILE="/etc/single-gpu-vfio.conf"
 readonly HOOK_FILE="/etc/libvirt/hooks/qemu.d/10-single-gpu-vfio"
@@ -19,68 +19,91 @@ die()  { printf '[single-gpu-vfio] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-single-gpu-vfio 1.0.0
+single-gpu-vfio 2.0.0
 
-Arch/EndeavourOS、GRUB、NVIDIA 单显卡直通配置工具。
+Personal Arch/EndeavourOS + GRUB + NVIDIA single-GPU VFIO tool.
 
-首次安装：
-  sudo ./single-gpu-vfio.sh install \
-    --vm-name omarchy-vfio \
-    --iso /absolute/path/to/installer.iso \
-    --gpu 0000:01:00.0 \
-    --audio 0000:01:00.1 \
-    --usb 0000:00:14.0 \
-    --disk /absolute/path/to/guest.qcow2 \
-    --disk-size 40G --memory 8192 --vcpus 4
+The workflow is intentionally split into three stages:
 
-install 选项：
-  --vm-name NAME             虚拟机名称（默认：single-gpu-vm）
-  --iso PATH                 安装 ISO，必填
-  --rom PATH                 已导出的 ROM；省略时自动调用 nvflash 提取
-  --nvflash PATH             nvflash 可执行文件（默认从 PATH 自动寻找）
-  --nvflash-index N          nvflash 显卡序号（单显卡默认：0）
-  --gpu BDF                  GPU PCI 地址；省略时自动选择第一块 NVIDIA VGA/3D 设备
-  --audio BDF                GPU HDMI 音频 PCI 地址；省略时尝试自动寻找
-  --usb BDF                  要整体直通的 USB 控制器，必填
-  --disk PATH                qcow2 路径（默认：/var/lib/libvirt/images/NAME.qcow2）
-  --disk-size SIZE           新磁盘大小（默认：40G）
-  --memory MiB               内存（默认：8192）
-  --vcpus N                  vCPU（默认：4）
-  --user NAME                图形会话用户（默认：SUDO_USER）
-  --display-manager SERVICE  默认自动检测 greetd/sddm/gdm/lightdm
-  --gpu-services LIST        交接前停止的服务，逗号分隔；默认自动加入 lactd
-  --yes                      跳过 IOMMU 分组确认
-  --allow-existing-hooks     允许系统中已有其他 VFIO hook（可能冲突）
-  --skip-packages            不安装软件包
+  1. Prepare the host (safe to run from a graphical terminal):
+     sudo ./single-gpu-vfio.sh setup-host --user YOUR_USER
 
-若省略 --rom，工具会优先使用 PATH 中的 nvflash。若尚未安装并检测到
-yay/paru，工具会在确认后用普通用户从 AUR 安装 nvflash，再自动提取。
+  2. Log out of the graphical desktop, switch to a real Linux console such as
+     Ctrl+Alt+F3, log in there, then extract and patch the VBIOS:
+     sudo single-gpu-vfio extract-rom \
+       --gpu 0000:01:00.0 \
+       --output /var/lib/libvirt/vbios/gtx1050.rom
 
-安装后的管理命令：
-  sudo single-gpu-vfio detect       显示可用 PCI 设备和环境
-  sudo single-gpu-vfio check        完整只读检查
-  sudo single-gpu-vfio test [秒]    定时停止并恢复的首次测试（默认 90 秒）
-  sudo single-gpu-vfio start        正式启动，不设自动停止
-  sudo single-gpu-vfio shutdown     向来宾发送正常关机请求
-  sudo single-gpu-vfio force-stop   强制关闭无响应的来宾
-  sudo single-gpu-vfio recover      来宾关闭后手动恢复宿主显卡
-  sudo single-gpu-vfio eject-iso    关机状态下弹出安装 ISO
-  sudo single-gpu-vfio status       显示虚拟机、设备和最近 hook 日志
-  sudo single-gpu-vfio remove       移除定义与 hook；保留磁盘和 ROM
+  3. Create the VM after rebooting with IOMMU enabled:
+     sudo single-gpu-vfio create-vm \
+       --vm-name omarchy-vfio \
+       --iso /absolute/path/to/installer.iso \
+       --rom /var/lib/libvirt/vbios/gtx1050.rom \
+       --gpu 0000:01:00.0 \
+       --audio 0000:01:00.1 \
+       --usb 0000:00:14.0 \
+       --disk /absolute/path/to/guest.qcow2 \
+       --disk-size 40G --memory 8192 --vcpus 4
 
-重要：
-  * test/start 会结束当前图形会话，请先保存工作。
-  * 正常退出请在来宾内选择“关机”；Ctrl+Alt+Delete 通常只是重启来宾。
-  * force-stop 相当于拔掉虚拟机电源，只用于来宾完全无响应时。
+setup-host options:
+  --user NAME                Desktop user (default: SUDO_USER)
+  --yes                      Skip confirmation prompts
+  --skip-packages            Do not install packages
+  --skip-nvflash             Do not offer nvflash installation from AUR
+
+extract-rom options:
+  --gpu BDF                  NVIDIA GPU PCI address (auto-detected if omitted)
+  --output PATH              Patched ROM output path (required)
+  --raw-output PATH          Raw nvflash backup path (default: OUTPUT.raw.rom)
+  --nvflash PATH             nvflash executable (default: detect from PATH)
+  --nvflash-index N          nvflash adapter index (single-GPU default: 0)
+  --display-manager SERVICE  Auto-detect greetd/sddm/gdm/lightdm by default
+  --gpu-services LIST        Comma-separated services to stop (auto: lactd)
+
+create-vm options:
+  --vm-name NAME             VM name (default: single-gpu-vm)
+  --iso PATH                 Installer ISO (required)
+  --rom PATH                 Patched or raw VBIOS (required and revalidated)
+  --gpu BDF                  NVIDIA GPU PCI address (auto-detected if omitted)
+  --audio BDF                NVIDIA HDMI audio address (auto-detected if omitted)
+  --usb BDF                  Whole USB controller to pass through (required)
+  --disk PATH                qcow2 path (default: /var/lib/libvirt/images/NAME.qcow2)
+  --disk-size SIZE           New disk size (default: 40G)
+  --memory MiB               Guest memory (default: 8192)
+  --vcpus N                  Guest vCPUs (default: 4)
+  --user NAME                Desktop user (default: SUDO_USER)
+  --display-manager SERVICE  Auto-detect greetd/sddm/gdm/lightdm by default
+  --gpu-services LIST        Comma-separated services to stop (auto: lactd)
+  --yes                      Skip IOMMU group confirmation
+  --allow-existing-hooks     Allow other existing VFIO hooks (may conflict)
+
+VM management commands:
+  sudo single-gpu-vfio detect
+  sudo single-gpu-vfio check
+  sudo single-gpu-vfio test [SECONDS]
+  sudo single-gpu-vfio start
+  sudo single-gpu-vfio shutdown
+  sudo single-gpu-vfio force-stop
+  sudo single-gpu-vfio recover
+  sudo single-gpu-vfio eject-iso
+  sudo single-gpu-vfio status
+  sudo single-gpu-vfio remove
+
+Important:
+  * extract-rom refuses to run from a GUI terminal, SSH, or pseudo-terminal.
+  * Log out of Plasma/Hyprland before running extract-rom from Ctrl+Alt+F3.
+  * test/start terminates the current graphical session. Save your work first.
+  * Shut down from inside the guest. Ctrl+Alt+Delete normally reboots it.
+  * force-stop is equivalent to pulling the guest power cable.
 EOF
 }
 
 require_root() {
-    (( EUID == 0 )) || die "此命令必须通过 sudo 或 pkexec 以 root 运行。"
+    (( EUID == 0 )) || die "Run this command as root with sudo or pkexec."
 }
 
 require_command() {
-    command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
 confirm() {
@@ -88,10 +111,10 @@ confirm() {
     if [[ "${ASSUME_YES:-0}" == "1" ]]; then
         return 0
     fi
-    [[ -t 0 ]] || die "$prompt（非交互模式请添加 --yes）"
+    [[ -t 0 ]] || die "$prompt (use --yes in non-interactive mode)"
     local answer
-    read -r -p "$prompt [输入 YES 继续]: " answer
-    [[ "$answer" == "YES" ]] || die "已取消。"
+    read -r -p "$prompt [type YES to continue]: " answer
+    [[ "$answer" == "YES" ]] || die "Cancelled."
 }
 
 normalize_bdf() {
@@ -100,7 +123,7 @@ normalize_bdf() {
         value="0000:$value"
     fi
     [[ "$value" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || \
-        die "无效 PCI 地址：$1（示例：0000:01:00.0）"
+        die "Invalid PCI address: $1 (example: 0000:01:00.0)"
     printf '%s\n' "$value"
 }
 
@@ -136,7 +159,7 @@ config_value() {
 }
 
 load_config() {
-    [[ -r "$CONFIG_FILE" ]] || die "尚未安装配置：$CONFIG_FILE"
+    [[ -r "$CONFIG_FILE" ]] || die "Configuration is not installed: $CONFIG_FILE"
     # The file is generated root-owned and mode 0600 by this tool.
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
@@ -166,7 +189,7 @@ detect_display_manager() {
             return
         fi
     done
-    die "无法自动检测显示管理器，请使用 --display-manager 指定。"
+    die "Could not detect a display manager; use --display-manager."
 }
 
 detect_gpu() {
@@ -205,17 +228,17 @@ show_iommu_group() {
 
 show_detection() {
     require_command lspci
-    log "版本：$VERSION"
-    printf '\n系统：\n'
+    log "Version: $VERSION"
+    printf '\nSystem:\n'
     sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null || true
-    printf '内核：%s\n' "$(uname -r)"
-    printf '启动参数：%s\n' "$(< /proc/cmdline)"
-    printf 'IOMMU 分组：%s\n' "$(iommu_active && printf active || printf inactive)"
-    printf '\nNVIDIA 显卡/音频：\n'
+    printf 'Kernel: %s\n' "$(uname -r)"
+    printf 'Kernel command line: %s\n' "$(< /proc/cmdline)"
+    printf 'IOMMU groups: %s\n' "$(iommu_active && printf active || printf inactive)"
+    printf '\nNVIDIA GPU/audio devices:\n'
     lspci -Dnnk | rg -A3 -i '(VGA compatible controller|3D controller|Audio device).*NVIDIA|NVIDIA.*(VGA compatible controller|3D controller|Audio device)' || true
-    printf '\nUSB 控制器：\n'
+    printf '\nUSB controllers:\n'
     lspci -Dnnk | rg -A3 'USB controller' || true
-    printf '\n显示管理器候选：\n'
+    printf '\nDisplay-manager candidates:\n'
     local service
     for service in greetd.service sddm.service gdm.service lightdm.service lxdm.service; do
         if systemctl list-unit-files "$service" --no-legend 2>/dev/null | grep -q .; then
@@ -227,9 +250,9 @@ show_detection() {
 }
 
 install_packages() {
-    [[ -e /etc/arch-release ]] || die "自动安装仅支持 Arch/EndeavourOS。"
+    [[ -e /etc/arch-release ]] || die "Automatic package installation supports Arch/EndeavourOS only."
     require_command pacman
-    log "安装 KVM/libvirt/OVMF 依赖……"
+    log "Installing KVM/libvirt/OVMF dependencies..."
     pacman -S --needed --noconfirm \
         qemu-desktop libvirt virt-manager edk2-ovmf swtpm dnsmasq \
         pciutils psmisc python ripgrep
@@ -237,7 +260,7 @@ install_packages() {
 }
 
 configure_grub_iommu() {
-    [[ -f /etc/default/grub ]] || die "找不到 /etc/default/grub；此工具只自动配置 GRUB。"
+    [[ -f /etc/default/grub ]] || die "Missing /etc/default/grub; only GRUB is configured automatically."
     require_command grub-mkconfig
 
     local cpu_vendor iommu_param
@@ -245,7 +268,7 @@ configure_grub_iommu() {
     case "$cpu_vendor" in
         GenuineIntel) iommu_param='intel_iommu=on' ;;
         AuthenticAMD) iommu_param='amd_iommu=on' ;;
-        *) die "未知 CPU 厂商：$cpu_vendor" ;;
+        *) die "Unknown CPU vendor: $cpu_vendor" ;;
     esac
 
     # shellcheck disable=SC1091
@@ -277,12 +300,12 @@ configure_grub_iommu() {
     install -o root -g root -m 0644 "$temporary" /etc/default/grub
     rm -f "$temporary"
     grub-mkconfig -o /boot/grub/grub.cfg
-    log "GRUB 已加入 $iommu_param iommu=pt。"
+    log "Added $iommu_param iommu=pt to GRUB."
 }
 
 prepare_rom() {
     local source_rom="$1" destination_rom="$2"
-    [[ -f "$source_rom" ]] || die "ROM 不存在：$source_rom"
+    [[ -f "$source_rom" ]] || die "ROM does not exist: $source_rom"
     require_command python3
     install -d -m 0755 "$(dirname "$destination_rom")"
     local temporary
@@ -336,7 +359,7 @@ for offset in range(0, max(0, len(data) - 1)):
         break
 
 if chosen is None:
-    raise SystemExit("ROM 中未找到带 EFI GOP 的有效 PCI option-ROM 链")
+    raise SystemExit("No valid PCI option-ROM chain with EFI GOP was found")
 
 offset, chain = chosen
 destination.write_bytes(data[offset:])
@@ -348,20 +371,41 @@ PY
 
     install -o root -g root -m 0644 "$temporary" "$destination_rom"
     rm -f "$temporary"
-    log "ROM 已安装：$destination_rom"
+    log "Installed patched ROM: $destination_rom"
     sha256sum "$destination_rom"
+}
+
+require_linux_vt() {
+    local terminal
+    terminal="$(tty 2>/dev/null || true)"
+    [[ "$terminal" =~ ^/dev/tty[0-9]+$ ]] || \
+        die "This command must run from a Linux virtual console such as Ctrl+Alt+F3, not from a GUI terminal, SSH, or /dev/pts."
+}
+
+graphical_session_active() {
+    local session type class
+    while read -r session _; do
+        [[ -n "$session" ]] || continue
+        type="$(loginctl show-session "$session" -p Type --value 2>/dev/null || true)"
+        class="$(loginctl show-session "$session" -p Class --value 2>/dev/null || true)"
+        case "$type:$class" in
+            wayland:user|wayland:user-early|x11:user|x11:user-early|mir:user|mir:user-early) return 0 ;;
+        esac
+    done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+    return 1
 }
 
 extract_rom_nvflash() {
     local nvflash_bin="$1" nvflash_index="$2" destination_raw="$3"
-    [[ -x "$nvflash_bin" ]] || die "nvflash 不可执行：$nvflash_bin"
-    [[ "$nvflash_index" =~ ^[0-9]+$ ]] || die "--nvflash-index 必须是非负整数。"
+    [[ -x "$nvflash_bin" ]] || die "nvflash is not executable: $nvflash_bin"
+    [[ "$nvflash_index" =~ ^[0-9]+$ ]] || die "--nvflash-index must be a non-negative integer."
+    require_linux_vt
+    graphical_session_active && \
+        die "A Wayland/X11 session is still active. Log out of the desktop, switch to Ctrl+Alt+F3, and try again."
     install -d -m 0755 "$(dirname "$destination_raw")"
     local temporary
     temporary="$(mktemp "$(dirname "$destination_raw")/.raw-rom.XXXXXX")"
-    # nvflash refuses to read while the proprietary driver is loaded.  This
-    # function runs from a root-owned transient systemd unit, so terminating
-    # the graphical user session cannot kill the extraction job.
+    log "The console may go black while the NVIDIA driver is unloaded. Do not power off the host."
     if ! (
         set -Eeuo pipefail
         local -a active_services=() vtconsoles=()
@@ -405,11 +449,6 @@ extract_rom_nvflash() {
             display_manager_was_active=1
             systemctl stop "$DISPLAY_MANAGER"
         fi
-        loginctl terminate-user "$HOST_USER" || true
-        pkill -TERM -u "$HOST_UID" || true
-        sleep 3
-        pgrep -u "$HOST_UID" >/dev/null 2>&1 && pkill -KILL -u "$HOST_UID" || true
-
         local -a nvidia_nodes=()
         mapfile -t nvidia_nodes < <(compgen -G '/dev/nvidia*' || true)
         local attempt
@@ -421,7 +460,7 @@ extract_rom_nvflash() {
         done
         if ((${#nvidia_nodes[@]} > 0)) && fuser "${nvidia_nodes[@]}" >/dev/null 2>&1; then
             fuser -v "${nvidia_nodes[@]}" || true
-            die "结束图形会话后 NVIDIA 设备仍被占用"
+            die "NVIDIA device nodes are still in use after stopping the display manager."
         fi
 
         local vtconsole
@@ -437,7 +476,7 @@ extract_rom_nvflash() {
         if [[ -L "$gpu_path/driver" ]]; then
             local driver
             driver="$(basename "$(readlink -f "$gpu_path/driver")")"
-            [[ "$driver" == nvidia ]] || die "nvflash 前 GPU 驱动应为 nvidia，实际为 $driver"
+            [[ "$driver" == nvidia ]] || die "Expected the nvidia driver before extraction, found: $driver"
             printf '%s' "$GPU_BDF" >"$gpu_path/driver/unbind"
         fi
         local module
@@ -445,18 +484,20 @@ extract_rom_nvflash() {
             [[ ! -d "/sys/module/$module" ]] || modprobe -r "$module"
         done
 
-        log "nvflash 检测到的 NVIDIA 显卡："
+        log "NVIDIA adapters reported by nvflash:"
         "$nvflash_bin" --list
-        log "从 nvflash adapter $nvflash_index 提取 VBIOS……"
+        log "Saving VBIOS from nvflash adapter $nvflash_index..."
         "$nvflash_bin" --index="$nvflash_index" --save "$temporary"
+        log "Verifying the saved raw ROM against the adapter..."
+        "$nvflash_bin" --index="$nvflash_index" --verify "$temporary"
     ); then
         rm -f "$temporary"
-        die "nvflash 自动释放/提取失败；宿主恢复流程已经执行。"
+        die "nvflash extraction or verification failed; host recovery was attempted."
     fi
-    [[ -s "$temporary" ]] || { rm -f "$temporary"; die "nvflash 生成了空 ROM。"; }
+    [[ -s "$temporary" ]] || { rm -f "$temporary"; die "nvflash produced an empty ROM."; }
     install -o root -g root -m 0644 "$temporary" "$destination_raw"
     rm -f "$temporary"
-    log "原始 VBIOS 已保留：$destination_raw"
+    log "Saved raw VBIOS backup: $destination_raw"
     sha256sum "$destination_raw"
 }
 
@@ -476,13 +517,13 @@ find_ovmf() {
     local candidate
     for candidate in "${code_candidates[@]}"; do [[ -f "$candidate" ]] && { OVMF_CODE="$candidate"; break; }; done
     for candidate in "${vars_candidates[@]}"; do [[ -f "$candidate" ]] && { OVMF_VARS="$candidate"; break; }; done
-    [[ -n "$OVMF_CODE" && -n "$OVMF_VARS" ]] || die "找不到非 Secure Boot OVMF CODE/VARS 固件。"
+    [[ -n "$OVMF_CODE" && -n "$OVMF_VARS" ]] || die "Could not find non-Secure-Boot OVMF CODE/VARS firmware."
 }
 
 ensure_default_network() {
     if ! virsh -c qemu:///system net-info default >/dev/null 2>&1; then
         local template='/usr/share/libvirt/networks/default.xml'
-        [[ -f "$template" ]] || die "libvirt 默认网络不存在，且找不到 $template"
+        [[ -f "$template" ]] || die "The libvirt default network is missing and $template was not found."
         virsh -c qemu:///system net-define "$template"
     fi
     virsh -c qemu:///system net-autostart default
@@ -557,8 +598,8 @@ create_domain_xml() {
     <type arch="x86_64" machine="q35">hvm</type>
     <loader readonly="yes" secure="no" type="pflash">$code_xml</loader>
     <nvram template="$vars_xml">/var/lib/libvirt/qemu/nvram/${vm_xml}_VARS.fd</nvram>
-    <boot dev="cdrom"/>
     <boot dev="hd"/>
+    <boot dev="cdrom"/>
   </os>
   <features>
     <acpi/>
@@ -642,15 +683,15 @@ EOF
 
 runtime_preflight() {
     load_config
-    iommu_active || die "当前内核没有可用的 IOMMU 分组；检查 BIOS 与 GRUB，并重启。"
-    [[ -f "$ROM_PATH" ]] || die "ROM 丢失：$ROM_PATH"
-    [[ -f "$DISK_PATH" ]] || die "虚拟磁盘丢失：$DISK_PATH"
+    iommu_active || die "No IOMMU groups are active; check firmware settings and GRUB, then reboot."
+    [[ -f "$ROM_PATH" ]] || die "ROM is missing: $ROM_PATH"
+    [[ -f "$DISK_PATH" ]] || die "Virtual disk is missing: $DISK_PATH"
     local bdf
     for bdf in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
-        [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI 设备不存在：$bdf"
-        [[ -L "/sys/bus/pci/devices/$bdf/iommu_group" ]] || die "PCI 设备没有 IOMMU 分组：$bdf"
+        [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI device does not exist: $bdf"
+        [[ -L "/sys/bus/pci/devices/$bdf/iommu_group" ]] || die "PCI device has no IOMMU group: $bdf"
     done
-    virsh -c qemu:///system dominfo "$VM_NAME" >/dev/null || die "libvirt 域不存在：$VM_NAME"
+    virsh -c qemu:///system dominfo "$VM_NAME" >/dev/null || die "libvirt domain does not exist: $VM_NAME"
 }
 
 domain_is_off() {
@@ -737,11 +778,11 @@ hook_prepare() (
     if [[ -L "$gpu_device/driver" ]]; then
         local driver
         driver="$(basename "$(readlink -f "$gpu_device/driver")")"
-        [[ "$driver" == "$GPU_HOST_DRIVER" ]] || die "GPU 当前驱动为 $driver，预期 $GPU_HOST_DRIVER"
+        [[ "$driver" == "$GPU_HOST_DRIVER" ]] || die "GPU driver is $driver; expected $GPU_HOST_DRIVER"
         printf '%s' "$GPU_BDF" >"$gpu_device/driver/unbind"
         hlog "unbound $GPU_BDF from $driver"
     fi
-    [[ ! -L "$gpu_device/driver" ]] || die "GPU 在 unbind 后仍绑定驱动"
+    [[ ! -L "$gpu_device/driver" ]] || die "GPU is still bound after the unbind request"
 
     local module
     for module in nvidia_drm nvidia_uvm nvidia_modeset nvidia; do
@@ -831,7 +872,7 @@ cmd_recover() {
     require_root
     load_config
     if virsh -c qemu:///system domstate "$VM_NAME" 2>/dev/null | grep -qiE 'running|paused|in shutdown|pmsuspended'; then
-        die "$VM_NAME 仍在运行；先 shutdown 或 force-stop。"
+        die "$VM_NAME is still active; run shutdown or force-stop first."
     fi
 
     local device path driver
@@ -866,21 +907,21 @@ cmd_recover() {
         systemctl is-enabled --quiet "$service" 2>/dev/null && systemctl start "$service" || true
     done
     systemctl start "$DISPLAY_MANAGER"
-    log "已请求恢复宿主显卡并启动 $DISPLAY_MANAGER。"
+    log "Requested host GPU recovery and started $DISPLAY_MANAGER."
 }
 
 cmd_check() {
     runtime_preflight
-    log "虚拟机：$VM_NAME ($(virsh -c qemu:///system domstate "$VM_NAME"))"
-    printf 'IOMMU/PCI：\n'
+    log "VM: $VM_NAME ($(virsh -c qemu:///system domstate "$VM_NAME"))"
+    printf 'IOMMU/PCI:\n'
     show_iommu_group "$GPU_BDF" || true
     show_iommu_group "$AUDIO_BDF" || true
     show_iommu_group "$USB_BDF" || true
-    printf '\n驱动：\n'
+    printf '\nDrivers:\n'
     printf '  %-14s %s\n' "$GPU_BDF" "$(pci_driver "$GPU_BDF")"
     printf '  %-14s %s\n' "$AUDIO_BDF" "$(pci_driver "$AUDIO_BDF")"
     printf '  %-14s %s\n' "$USB_BDF" "$(pci_driver "$USB_BDF")"
-    printf '\n文件：\n'
+    printf '\nFiles:\n'
     stat -c '  %A %U:%G %s %n' "$ROM_PATH" "$DISK_PATH" "$ISO_PATH" 2>/dev/null || true
     qemu-img check "$DISK_PATH"
 
@@ -891,19 +932,19 @@ cmd_check() {
     if rg -q 'display["=]|x-vga|OVMF_CODE\.secboot' "$native"; then
         rg 'display["=]|x-vga|OVMF_CODE\.secboot' "$native" >&2
         rm -f "$native"
-        die "发现不应存在的 vGPU/x-vga/Secure Boot 参数。"
+        die "Found forbidden vGPU, x-vga, or Secure Boot parameters."
     fi
     rm -f "$native"
-    log "检查通过。"
+    log "Checks passed."
 }
 
 cmd_test() {
     require_root
     runtime_preflight
-    domain_is_off || die "$VM_NAME 当前不是 shut off。"
+    domain_is_off || die "$VM_NAME is not shut off."
     local timeout_seconds="${1:-90}"
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] && (( timeout_seconds >= 30 && timeout_seconds <= 600 )) || \
-        die "测试秒数必须在 30–600 之间。"
+        die "Test duration must be between 30 and 600 seconds."
     local run_id safety_unit launch_unit
     run_id="$(date +%s)-$$"
     safety_unit="single-gpu-vfio-safety-$run_id"
@@ -911,7 +952,7 @@ cmd_test() {
     systemd-run --quiet --collect --unit="$safety_unit" \
         --on-active="${timeout_seconds}s" --timer-property=AccuracySec=1s \
         /usr/bin/bash -c "/usr/bin/virsh -c qemu:///system destroy '$VM_NAME' >/dev/null 2>&1 || true; '$INSTALLED_TOOL' recover || true"
-    log "启动 $VM_NAME；已设置 ${timeout_seconds} 秒后强制停止并恢复宿主。"
+    log "Starting $VM_NAME; forced stop and host recovery are armed for ${timeout_seconds} seconds."
     systemd-run --collect --unit="$launch_unit" \
         /usr/bin/virsh -c qemu:///system start --reset-nvram "$VM_NAME"
 }
@@ -919,9 +960,9 @@ cmd_test() {
 cmd_start() {
     require_root
     runtime_preflight
-    domain_is_off || die "$VM_NAME 当前不是 shut off。"
+    domain_is_off || die "$VM_NAME is not shut off."
     local unit="single-gpu-vfio-start-$(date +%s)-$$"
-    log "启动 $VM_NAME；当前图形会话将结束。"
+    log "Starting $VM_NAME; the current graphical session will terminate."
     systemd-run --collect --unit="$unit" \
         /usr/bin/virsh -c qemu:///system start "$VM_NAME"
 }
@@ -930,14 +971,14 @@ cmd_shutdown() {
     require_root
     load_config
     virsh -c qemu:///system shutdown "$VM_NAME"
-    log "已向 $VM_NAME 发送 ACPI 关机请求。"
+    log "Sent an ACPI shutdown request to $VM_NAME."
 }
 
 cmd_force_stop() {
     require_root
     load_config
-    warn "即将强制关闭 $VM_NAME，效果相当于拔掉虚拟机电源。"
-    confirm "确定强制关闭吗？"
+    warn "This will force-stop $VM_NAME, equivalent to pulling its power cable."
+    confirm "Force-stop the VM?"
     virsh -c qemu:///system destroy "$VM_NAME" || true
     sleep 2
     cmd_recover
@@ -961,34 +1002,158 @@ cmd_status() {
 cmd_eject_iso() {
     require_root
     load_config
-    domain_is_off || die "请先关闭 $VM_NAME。"
+    domain_is_off || die "Shut down $VM_NAME first."
     virsh -c qemu:///system change-media "$VM_NAME" sda --eject --config
-    log "已弹出安装 ISO；下次将从虚拟硬盘启动。"
+    log "Installer ISO ejected; the next boot will use the virtual disk."
 }
 
 cmd_remove() {
     require_root
     load_config
-    domain_is_off || die "请先关闭 $VM_NAME。"
-    warn "将移除 libvirt 定义、hook、配置和已安装的管理工具。"
-    warn "不会删除磁盘 $DISK_PATH，也不会删除 ROM $ROM_PATH。"
-    confirm "确定移除吗？"
+    domain_is_off || die "Shut down $VM_NAME first."
+    warn "This removes the libvirt definition, hook, configuration, and installed tool."
+    warn "The disk $DISK_PATH and ROM $ROM_PATH will be preserved."
+    confirm "Remove the configuration?"
     virsh -c qemu:///system undefine "$VM_NAME" --nvram 2>/dev/null || \
         virsh -c qemu:///system undefine "$VM_NAME" 2>/dev/null || true
     rm -f "$HOOK_FILE" "$CONFIG_FILE"
-    log "已移除配置。IOMMU 启动参数、软件包、磁盘和 ROM 保留。"
+    log "Configuration removed. IOMMU parameters, packages, disk, and ROM were preserved."
     rm -f "$INSTALLED_TOOL"
 }
 
-cmd_install() {
+cmd_setup_host() {
     require_root
-    local -a original_install_args=("$@")
-    VM_NAME='single-gpu-vm'
-    ISO_PATH=''
-    ROM_SOURCE=''
+    HOST_USER="${SUDO_USER:-}"
+    ASSUME_YES=0
+    SKIP_PACKAGES=0
+    SKIP_NVFLASH=0
+
+    while (($#)); do
+        case "$1" in
+            --user) HOST_USER="${2:?}"; shift 2 ;;
+            --yes) ASSUME_YES=1; shift ;;
+            --skip-packages) SKIP_PACKAGES=1; shift ;;
+            --skip-nvflash) SKIP_NVFLASH=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown setup-host option: $1" ;;
+        esac
+    done
+
+    [[ -n "$HOST_USER" && "$HOST_USER" != root ]] || die "Could not determine the desktop user; use --user."
+    id "$HOST_USER" >/dev/null 2>&1 || die "User does not exist: $HOST_USER"
+
+    if (( ! SKIP_PACKAGES )); then install_packages; fi
+    if (( ! SKIP_NVFLASH )) && ! command -v nvflash >/dev/null 2>&1 && ! command -v nvflash_linux >/dev/null 2>&1; then
+        local aur_helper=''
+        aur_helper="$(command -v yay 2>/dev/null || command -v paru 2>/dev/null || true)"
+        if [[ -n "$aur_helper" ]]; then
+            warn "nvflash is an AUR package and will be built with $(basename "$aur_helper")."
+            confirm "Install the nvflash AUR package?"
+            sudo -H -u "$HOST_USER" "$aur_helper" -S --needed nvflash
+        else
+            warn "nvflash is not installed and no yay/paru helper was found. Install it before extract-rom."
+        fi
+    fi
+
+    if ! grep -qwE 'intel_iommu=on|amd_iommu=on' /proc/cmdline || ! grep -qw iommu=pt /proc/cmdline; then
+        configure_grub_iommu
+        warn "Reboot is required before create-vm or test."
+    else
+        log "IOMMU kernel parameters are already active."
+    fi
+
+    usermod -a -G libvirt,kvm "$HOST_USER"
+    local self_path
+    self_path="$(readlink -f "$0")"
+    if [[ "$self_path" != "$INSTALLED_TOOL" ]]; then
+        install -o root -g root -m 0755 "$self_path" "$INSTALLED_TOOL"
+    fi
+    log "Host setup complete."
+    log "Next: log out of the desktop, switch to Ctrl+Alt+F3, and run extract-rom."
+}
+
+cmd_extract_rom() {
+    GPU_BDF=''
+    ROM_PATH=''
+    RAW_ROM_PATH=''
     NVFLASH_BIN=''
     NVFLASH_INDEX='0'
     NVFLASH_INDEX_SET=0
+    DISPLAY_MANAGER=''
+    GPU_SERVICES='auto'
+    ASSUME_YES=0
+
+    while (($#)); do
+        case "$1" in
+            --gpu) GPU_BDF="${2:?}"; shift 2 ;;
+            --output) ROM_PATH="${2:?}"; shift 2 ;;
+            --raw-output) RAW_ROM_PATH="${2:?}"; shift 2 ;;
+            --nvflash) NVFLASH_BIN="${2:?}"; shift 2 ;;
+            --nvflash-index) NVFLASH_INDEX="${2:?}"; NVFLASH_INDEX_SET=1; shift 2 ;;
+            --display-manager) DISPLAY_MANAGER="${2:?}"; shift 2 ;;
+            --gpu-services) GPU_SERVICES="${2:?}"; shift 2 ;;
+            --yes) ASSUME_YES=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown extract-rom option: $1" ;;
+        esac
+    done
+
+    require_root
+    require_linux_vt
+
+    require_command lspci
+    GPU_BDF="${GPU_BDF:-$(detect_gpu)}"
+    [[ -n "$GPU_BDF" ]] || die "No NVIDIA VGA/3D device was detected; use --gpu."
+    GPU_BDF="$(normalize_bdf "$GPU_BDF")"
+    [[ -e "/sys/bus/pci/devices/$GPU_BDF" ]] || die "PCI device does not exist: $GPU_BDF"
+    [[ "$(pci_class "$GPU_BDF")" == 0x0300* || "$(pci_class "$GPU_BDF")" == 0x0302* ]] || \
+        die "$GPU_BDF is not a VGA/3D controller."
+    [[ "$(pci_driver "$GPU_BDF")" == nvidia ]] || die "$GPU_BDF is not using the nvidia driver."
+    [[ -n "$ROM_PATH" && "$ROM_PATH" == /* ]] || die "--output must be an absolute path."
+    if [[ -z "$RAW_ROM_PATH" ]]; then
+        RAW_ROM_PATH="${ROM_PATH%.rom}.raw.rom"
+    fi
+    [[ "$RAW_ROM_PATH" == /* && "$RAW_ROM_PATH" != "$ROM_PATH" ]] || \
+        die "--raw-output must be an absolute path different from --output."
+
+    NVFLASH_BIN="${NVFLASH_BIN:-$(command -v nvflash 2>/dev/null || command -v nvflash_linux 2>/dev/null || true)}"
+    [[ -n "$NVFLASH_BIN" ]] || die "nvflash was not found. Run setup-host or use --nvflash."
+    NVFLASH_BIN="$(readlink -f "$NVFLASH_BIN")"
+    local nvidia_gpu_count
+    nvidia_gpu_count="$(lspci -Dnn | awk '/NVIDIA/ && (/VGA compatible controller/ || /3D controller/) {count++} END {print count+0}')"
+    if (( nvidia_gpu_count > 1 && ! NVFLASH_INDEX_SET )); then
+        die "Multiple NVIDIA GPUs were detected; inspect nvflash --list and use --nvflash-index."
+    fi
+
+    DISPLAY_MANAGER="${DISPLAY_MANAGER:-$(detect_display_manager)}"
+    [[ "$DISPLAY_MANAGER" == *.service ]] || DISPLAY_MANAGER="${DISPLAY_MANAGER}.service"
+    if [[ "$GPU_SERVICES" == auto ]]; then
+        GPU_SERVICES=''
+        systemctl list-unit-files lactd.service --no-legend 2>/dev/null | grep -q . && GPU_SERVICES='lactd.service'
+    else
+        GPU_SERVICES="${GPU_SERVICES//,/ }"
+    fi
+    local service
+    for service in $GPU_SERVICES; do
+        [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "Invalid service name: $service"
+    done
+
+    if [[ -e "$ROM_PATH" || -e "$RAW_ROM_PATH" ]]; then
+        warn "The output or raw backup already exists and will be replaced."
+        confirm "Replace existing ROM output files?"
+    fi
+    extract_rom_nvflash "$NVFLASH_BIN" "$NVFLASH_INDEX" "$RAW_ROM_PATH"
+    prepare_rom "$RAW_ROM_PATH" "$ROM_PATH"
+    log "ROM extraction, hardware verification, and patching completed."
+    log "Raw ROM: $RAW_ROM_PATH"
+    log "Patched ROM: $ROM_PATH"
+}
+
+cmd_create_vm() {
+    require_root
+    VM_NAME='single-gpu-vm'
+    ISO_PATH=''
+    ROM_SOURCE=''
     GPU_BDF=''
     AUDIO_BDF=''
     USB_BDF=''
@@ -1001,15 +1166,12 @@ cmd_install() {
     GPU_SERVICES='auto'
     ASSUME_YES=0
     ALLOW_EXISTING_HOOKS=0
-    SKIP_PACKAGES=0
 
     while (($#)); do
         case "$1" in
             --vm-name) VM_NAME="${2:?}"; shift 2 ;;
             --iso) ISO_PATH="${2:?}"; shift 2 ;;
             --rom) ROM_SOURCE="${2:?}"; shift 2 ;;
-            --nvflash) NVFLASH_BIN="${2:?}"; shift 2 ;;
-            --nvflash-index) NVFLASH_INDEX="${2:?}"; NVFLASH_INDEX_SET=1; shift 2 ;;
             --gpu) GPU_BDF="${2:?}"; shift 2 ;;
             --audio) AUDIO_BDF="${2:?}"; shift 2 ;;
             --usb) USB_BDF="${2:?}"; shift 2 ;;
@@ -1022,75 +1184,50 @@ cmd_install() {
             --gpu-services) GPU_SERVICES="${2:?}"; shift 2 ;;
             --yes) ASSUME_YES=1; shift ;;
             --allow-existing-hooks) ALLOW_EXISTING_HOOKS=1; shift ;;
-            --skip-packages) SKIP_PACKAGES=1; shift ;;
             -h|--help) usage; exit 0 ;;
-            *) die "未知 install 参数：$1" ;;
+            *) die "Unknown create-vm option: $1" ;;
         esac
     done
 
-    [[ "$VM_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "VM 名称只能包含字母、数字、点、下划线和连字符。"
-    [[ -n "$ISO_PATH" && -f "$ISO_PATH" ]] || die "必须通过 --iso 指定存在的 ISO。"
-    [[ -z "$ROM_SOURCE" || -f "$ROM_SOURCE" ]] || die "--rom 指定的文件不存在：$ROM_SOURCE"
-    [[ -n "$USB_BDF" ]] || die "必须通过 --usb 指定要整体直通的 USB 控制器。"
-    [[ -n "$HOST_USER" && "$HOST_USER" != root ]] || die "无法确定普通图形用户，请使用 --user。"
-    id "$HOST_USER" >/dev/null 2>&1 || die "用户不存在：$HOST_USER"
+    [[ "$VM_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "VM name may contain only letters, digits, dots, underscores, and hyphens."
+    [[ -n "$ISO_PATH" && -f "$ISO_PATH" ]] || die "--iso must point to an existing installer ISO."
+    [[ -n "$ROM_SOURCE" && -f "$ROM_SOURCE" ]] || die "--rom must point to an existing VBIOS file."
+    [[ -n "$USB_BDF" ]] || die "--usb must specify a whole USB controller."
+    [[ -n "$HOST_USER" && "$HOST_USER" != root ]] || die "Could not determine the desktop user; use --user."
+    id "$HOST_USER" >/dev/null 2>&1 || die "User does not exist: $HOST_USER"
     HOST_UID="$(id -u "$HOST_USER")"
-    (( HOST_UID > 0 )) || die "拒绝终止 root 会话。"
-    [[ "$MEMORY_MIB" =~ ^[0-9]+$ ]] && (( MEMORY_MIB >= 2048 )) || die "--memory 至少为 2048 MiB。"
-    [[ "$VCPUS" =~ ^[0-9]+$ ]] && (( VCPUS >= 1 )) || die "--vcpus 必须是正整数。"
-    [[ "$DISK_SIZE" =~ ^[1-9][0-9]*[GMTP]$ ]] || die "--disk-size 示例：40G。"
+    (( HOST_UID > 0 )) || die "Refusing to terminate root sessions."
+    [[ "$MEMORY_MIB" =~ ^[0-9]+$ ]] && (( MEMORY_MIB >= 2048 )) || die "--memory must be at least 2048 MiB."
+    [[ "$VCPUS" =~ ^[0-9]+$ ]] && (( VCPUS >= 1 )) || die "--vcpus must be a positive integer."
+    [[ "$DISK_SIZE" =~ ^[1-9][0-9]*[GMTP]$ ]] || die "Invalid --disk-size (example: 40G)."
 
-    if (( ! SKIP_PACKAGES )); then install_packages; fi
     require_command lspci
     require_command virsh
     require_command qemu-img
     require_command virt-xml-validate
     require_command systemd-run
+    iommu_active || die "IOMMU is not active. Run setup-host and reboot first."
 
     GPU_BDF="${GPU_BDF:-$(detect_gpu)}"
-    [[ -n "$GPU_BDF" ]] || die "未检测到 NVIDIA VGA/3D 设备，请使用 --gpu。"
+    [[ -n "$GPU_BDF" ]] || die "No NVIDIA VGA/3D device was detected; use --gpu."
     GPU_BDF="$(normalize_bdf "$GPU_BDF")"
     AUDIO_BDF="${AUDIO_BDF:-$(detect_gpu_audio "$GPU_BDF")}"
-    [[ -n "$AUDIO_BDF" ]] || die "未找到同槽位 NVIDIA 音频设备，请使用 --audio。"
+    [[ -n "$AUDIO_BDF" ]] || die "No matching NVIDIA HDMI audio device was found; use --audio."
     AUDIO_BDF="$(normalize_bdf "$AUDIO_BDF")"
     USB_BDF="$(normalize_bdf "$USB_BDF")"
 
-    if [[ -z "$ROM_SOURCE" ]]; then
-        if [[ -z "$NVFLASH_BIN" ]]; then
-            NVFLASH_BIN="$(command -v nvflash 2>/dev/null || command -v nvflash_linux 2>/dev/null || true)"
-        fi
-        if [[ -z "$NVFLASH_BIN" ]]; then
-            local aur_helper=''
-            aur_helper="$(command -v yay 2>/dev/null || command -v paru 2>/dev/null || true)"
-            if [[ -n "$aur_helper" ]]; then
-                warn "nvflash 不在官方 Arch 仓库中；将通过 $(basename "$aur_helper") 构建并安装 AUR 包。"
-                confirm "允许安装 AUR 包 nvflash 吗？"
-                sudo -H -u "$HOST_USER" "$aur_helper" -S --needed nvflash
-                NVFLASH_BIN="$(command -v nvflash 2>/dev/null || true)"
-            fi
-        fi
-        [[ -n "$NVFLASH_BIN" ]] || die "未找到 nvflash。请先从 AUR 安装 nvflash、通过 --nvflash 指定程序，或使用 --rom。"
-        NVFLASH_BIN="$(readlink -f "$NVFLASH_BIN")"
-        local nvidia_gpu_count
-        nvidia_gpu_count="$(lspci -Dnn | awk '/NVIDIA/ && (/VGA compatible controller/ || /3D controller/) {count++} END {print count+0}')"
-        if (( nvidia_gpu_count > 1 && ! NVFLASH_INDEX_SET )); then
-            die "检测到多块 NVIDIA GPU；请用 nvflash --list 核对后指定 --nvflash-index。"
-        fi
-    fi
-
     local bdf
     for bdf in "$GPU_BDF" "$AUDIO_BDF" "$USB_BDF"; do
-        [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI 设备不存在：$bdf"
+        [[ -e "/sys/bus/pci/devices/$bdf" ]] || die "PCI device does not exist: $bdf"
     done
-    [[ "$(pci_class "$GPU_BDF")" == 0x0300* || "$(pci_class "$GPU_BDF")" == 0x0302* ]] || \
-        die "$GPU_BDF 不是 VGA/3D 控制器。"
-    [[ "$(pci_class "$AUDIO_BDF")" == 0x0403* ]] || die "$AUDIO_BDF 不是 HDA 音频设备。"
-    [[ "$(pci_class "$USB_BDF")" == 0x0c03* ]] || die "$USB_BDF 不是 USB 控制器。"
-
+    [[ "$(pci_class "$GPU_BDF")" == 0x0300* || "$(pci_class "$GPU_BDF")" == 0x0302* ]] || die "$GPU_BDF is not a VGA/3D controller."
+    [[ "$(pci_class "$AUDIO_BDF")" == 0x0403* ]] || die "$AUDIO_BDF is not an HDA audio device."
+    [[ "$(pci_class "$USB_BDF")" == 0x0c03* ]] || die "$USB_BDF is not a USB controller."
     GPU_HOST_DRIVER="$(pci_driver "$GPU_BDF")"
-    [[ "$GPU_HOST_DRIVER" == nvidia ]] || die "GPU 必须由 nvidia 驱动，当前为 $GPU_HOST_DRIVER。"
+    [[ "$GPU_HOST_DRIVER" == nvidia ]] || die "GPU must use the nvidia driver; current driver: $GPU_HOST_DRIVER"
     AUDIO_HOST_MODULE='snd_hda_intel'
     USB_HOST_MODULE='xhci_pci'
+
     DISPLAY_MANAGER="${DISPLAY_MANAGER:-$(detect_display_manager)}"
     [[ "$DISPLAY_MANAGER" == *.service ]] || DISPLAY_MANAGER="${DISPLAY_MANAGER}.service"
     if [[ "$GPU_SERVICES" == auto ]]; then
@@ -1099,75 +1236,47 @@ cmd_install() {
     else
         GPU_SERVICES="${GPU_SERVICES//,/ }"
     fi
+    local service
     for service in $GPU_SERVICES; do
-        [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "无效服务名：$service"
+        [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || die "Invalid service name: $service"
     done
 
     if (( ! ALLOW_EXISTING_HOOKS )); then
         local existing=''
-        existing="$(rg -l -i 'vfio|nvidia.*unbind|nodedev-detach' /etc/libvirt/hooks 2>/dev/null | \
-            grep -vFx "$HOOK_FILE" || true)"
-        [[ -z "$existing" ]] || die "发现可能冲突的现有 VFIO hook：\n$existing\n确认兼容后使用 --allow-existing-hooks。"
+        existing="$(rg -l -i 'vfio|nvidia.*unbind|nodedev-detach' /etc/libvirt/hooks 2>/dev/null | grep -vFx "$HOOK_FILE" || true)"
+        [[ -z "$existing" ]] || die "Potentially conflicting VFIO hooks were found:\n$existing\nReview them or use --allow-existing-hooks."
     fi
 
-    if ! grep -qwE 'intel_iommu=on|amd_iommu=on' /proc/cmdline || ! grep -qw iommu=pt /proc/cmdline; then
-        configure_grub_iommu
-        warn "当前启动尚未使用新的 IOMMU 参数；完成安装后必须重启再运行 check/test。"
-    fi
-
-    if iommu_active; then
-        printf '\n将要直通的 IOMMU 分组：\n'
-        show_iommu_group "$GPU_BDF" || true
-        show_iommu_group "$AUDIO_BDF" || true
-        show_iommu_group "$USB_BDF" || true
-        confirm "确认这些分组中的全部设备都可以交给虚拟机吗？"
-    else
-        warn "IOMMU 当前未激活，无法验证分组；重启后必须运行 check。"
-    fi
-
-    if [[ -z "$ROM_SOURCE" && "${SGVFIO_INSTALL_WORKER:-0}" != "1" ]]; then
-        local self_path install_unit
-        self_path="$(readlink -f "$0")"
-        install -o root -g root -m 0755 "$self_path" "$INSTALLED_TOOL"
-        install_unit="single-gpu-vfio-install-$(date +%s)-$$"
-        log "VBIOS 自动提取需要注销图形会话；配置将由 systemd 任务继续。"
-        log "恢复登录后可查看：sudo journalctl -u $install_unit"
-        systemd-run --collect --unit="$install_unit" --setenv=SGVFIO_INSTALL_WORKER=1 \
-            "$INSTALLED_TOOL" install "${original_install_args[@]}" \
-            --user "$HOST_USER" --yes --skip-packages
-        return
-    fi
+    printf '\nIOMMU groups selected for passthrough:\n'
+    show_iommu_group "$GPU_BDF" || true
+    show_iommu_group "$AUDIO_BDF" || true
+    show_iommu_group "$USB_BDF" || true
+    confirm "Can every device in these groups be assigned to the VM?"
 
     DISK_PATH="${DISK_PATH:-/var/lib/libvirt/images/${VM_NAME}.qcow2}"
-    [[ "$ISO_PATH" == /* && "$DISK_PATH" == /* ]] || die "ISO 和磁盘必须使用绝对路径。"
-    [[ -z "$ROM_SOURCE" || "$ROM_SOURCE" == /* ]] || die "--rom 必须使用绝对路径。"
+    [[ "$ISO_PATH" == /* && "$ROM_SOURCE" == /* && "$DISK_PATH" == /* ]] || \
+        die "ISO, ROM, and disk paths must be absolute."
     install -d -m 0755 "$(dirname "$DISK_PATH")"
     if [[ ! -e "$DISK_PATH" ]]; then
         qemu-img create -f qcow2 "$DISK_PATH" "$DISK_SIZE"
     else
         qemu-img check "$DISK_PATH"
-        warn "保留已有虚拟磁盘：$DISK_PATH"
+        warn "Preserving existing virtual disk: $DISK_PATH"
     fi
 
-    RAW_ROM_PATH="/var/lib/libvirt/vbios/${VM_NAME}.raw.rom"
+    RAW_ROM_PATH="$ROM_SOURCE"
     ROM_PATH="/var/lib/libvirt/vbios/${VM_NAME}.rom"
-    if [[ -n "$ROM_SOURCE" ]]; then
-        install -d -m 0755 "$(dirname "$RAW_ROM_PATH")"
-        install -o root -g root -m 0644 "$ROM_SOURCE" "$RAW_ROM_PATH"
-        log "原始 VBIOS 已保留：$RAW_ROM_PATH"
-    else
-        extract_rom_nvflash "$NVFLASH_BIN" "$NVFLASH_INDEX" "$RAW_ROM_PATH"
-    fi
-    prepare_rom "$RAW_ROM_PATH" "$ROM_PATH"
+    prepare_rom "$ROM_SOURCE" "$ROM_PATH"
     find_ovmf
     ensure_default_network
 
     install -d -m 0755 "$BACKUP_DIR"
     if virsh -c qemu:///system dominfo "$VM_NAME" >/dev/null 2>&1; then
+        local domain_state
         domain_state="$(virsh -c qemu:///system domstate "$VM_NAME")"
-        [[ "$domain_state" == "shut off" ]] || die "已有域 $VM_NAME 正在运行。"
+        [[ "$domain_state" == "shut off" ]] || die "Existing domain $VM_NAME is active."
         virsh -c qemu:///system dumpxml "$VM_NAME" >"$BACKUP_DIR/${VM_NAME}.$(date +%Y%m%d-%H%M%S).xml"
-        warn "将更新已有 libvirt 域：$VM_NAME"
+        warn "Updating existing libvirt domain: $VM_NAME"
     fi
 
     local self_path
@@ -1186,23 +1295,17 @@ cmd_install() {
     virsh -c qemu:///system domxml-to-native qemu-argv "$xml_file" >"$native_file"
     if rg -q 'display["=]|x-vga|OVMF_CODE\.secboot' "$native_file"; then
         rm -f "$xml_file" "$native_file"
-        die "生成的 QEMU 参数包含禁止的 display/x-vga/Secure Boot 配置。"
+        die "Generated QEMU arguments contain forbidden display, x-vga, or Secure Boot settings."
     fi
     virsh -c qemu:///system define "$xml_file"
     rm -f "$xml_file" "$native_file"
     virsh -c qemu:///system autostart "$VM_NAME" --disable >/dev/null 2>&1 || true
-
     usermod -a -G libvirt,kvm "$HOST_USER"
     systemctl restart libvirtd.service
 
-    log "安装完成。"
-    printf '\n下一步：\n'
-    if iommu_active; then
-        printf '  sudo %s check\n  sudo %s test 90\n' "$INSTALLED_TOOL" "$INSTALLED_TOOL"
-    else
-        printf '  1. 重启宿主\n  2. sudo %s check\n  3. sudo %s test 90\n' "$INSTALLED_TOOL" "$INSTALLED_TOOL"
-    fi
-    printf '\n正常启动：sudo %s start\n' "$INSTALLED_TOOL"
+    log "VM creation complete."
+    printf '\nNext steps:\n  sudo %s check\n  sudo %s test 90\n' "$INSTALLED_TOOL" "$INSTALLED_TOOL"
+    printf '\nNormal start:\n  sudo %s start\n' "$INSTALLED_TOOL"
 }
 
 main() {
@@ -1212,7 +1315,10 @@ main() {
         help|-h|--help) usage ;;
         version|--version) printf '%s\n' "$VERSION" ;;
         detect) show_detection ;;
-        install) cmd_install "$@" ;;
+        setup-host) cmd_setup_host "$@" ;;
+        extract-rom) cmd_extract_rom "$@" ;;
+        create-vm) cmd_create_vm "$@" ;;
+        install) die "The install command was split into setup-host, extract-rom, and create-vm. Run $0 help." ;;
         check) cmd_check "$@" ;;
         test) cmd_test "$@" ;;
         start) cmd_start "$@" ;;
@@ -1223,7 +1329,7 @@ main() {
         status) cmd_status "$@" ;;
         remove) cmd_remove "$@" ;;
         hook) cmd_hook "$@" ;;
-        *) die "未知命令：$command（运行 $0 help 查看帮助）" ;;
+        *) die "Unknown command: $command (run $0 help)." ;;
     esac
 }
 

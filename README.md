@@ -27,6 +27,7 @@
 - 验证 ROM 的 `55 aa`、`PCIR`、PCI ID 与 EFI GOP，并自动去掉 NVIDIA 容器头；
 - 分别保留原始 ROM 和处理后的 ROM，并打印 SHA-256；
 - 创建 qcow2、libvirt NAT 网络和最小化 Q35/OVMF 虚拟机；
+- 保留 NVIDIA HDMI/DP 音频直通，并可将主板模拟输出通过虚拟 Intel HDA/ALSA 提供给来宾；
 - 安装单显卡释放/恢复 hook；
 - 提供带自动回退的首次测试、正常启动、关机、强制停止和紧急恢复命令。
 
@@ -75,6 +76,7 @@ sudo single-gpu-vfio create-vm \
   --rom /var/lib/libvirt/vbios/gtx1050.rom \
   --gpu 0000:01:00.0 \
   --audio 0000:01:00.1 \
+  --host-audio hw:PCH,0 \
   --usb 0000:00:14.0 \
   --disk /absolute/path/to/omarchy-vfio.qcow2 \
   --disk-size 40G \
@@ -84,6 +86,8 @@ sudo single-gpu-vfio create-vm \
 ```
 
 `create-vm` 会再次解析并验证 ROM，然后展示 GPU、显卡音频和 USB 控制器的 IOMMU 分组，得到确认后才生成虚拟机和 hook。已有虚拟磁盘不会被覆盖。
+
+`--audio` 是随显卡一起直通的 NVIDIA HDMI/DP 音频。`--host-audio` 则用于宿主的主板模拟输出；默认值 `auto` 会选择第一块非 NVIDIA ALSA 播放设备。使用 `--host-audio none` 可以禁用虚拟声卡，只保留 HDMI/DP 音频。主板声卡若与 ISA、PMC、SMBus 等设备共用 IOMMU 组，不应直接进行 PCI 直通。
 
 ## 启动与关机
 

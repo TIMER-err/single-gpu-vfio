@@ -44,7 +44,7 @@
 这一步可以在 KDE/Plasma 的图形终端中运行：
 
 ```bash
-sudo ./single-gpu-vfio.sh setup-host --user timer
+sudo ./single-gpu-vfio.sh setup-host --user <username>
 ```
 
 它会安装依赖和 `nvflash`、配置 GRUB IOMMU、把用户加入 `libvirt`/`kvm` 组，并将工具安装为 `/usr/local/sbin/single-gpu-vfio`。
@@ -72,13 +72,13 @@ sudo single-gpu-vfio extract-rom \
 ```bash
 sudo single-gpu-vfio create-vm \
   --vm-name omarchy-vfio \
-  --iso /absolute/path/to/omarchy.iso \
+  --iso /absolute/path/to/install.iso \
   --rom /var/lib/libvirt/vbios/gtx1050.rom \
   --gpu 0000:01:00.0 \
   --audio 0000:01:00.1 \
   --sound 0000:00:1f.3 \
   --usb 0000:00:14.0 \
-  --disk /absolute/path/to/omarchy-vfio.qcow2 \
+  --disk /absolute/path/to/disk-vfio.qcow2 \
   --disk-size 40G \
   --memory 8192 \
   --vcpus 4 \

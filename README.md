@@ -82,7 +82,7 @@ sudo single-gpu-vfio create-vm \
   --disk-size 40G \
   --memory 8192 \
   --vcpus 4 \
-  --user timer
+  --user <username>
 ```
 
 `create-vm` 会再次解析并验证 ROM，然后展示 GPU、显卡音频、主板声卡和 USB 控制器的 IOMMU 分组，得到确认后才生成虚拟机和 hook。已有虚拟磁盘不会被覆盖。
